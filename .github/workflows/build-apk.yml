@@ -1,0 +1,32 @@
+name: Build Signed APK
+on: [push] # This triggers the build every time you push code
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Decode Keystore
+        run: echo "${{ secrets.SIGNING_KEY }}" | base64 --decode > android/app/release-key.jks
+
+      - name: Build with Gradle
+        run: cd android && ./gradlew assembleRelease
+        env:
+          # These map your GitHub secrets to the build process
+          STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Signed-DPC-APK
+          path: android/app/build/outputs/apk/release/app-release.apk

