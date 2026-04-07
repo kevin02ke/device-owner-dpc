@@ -7,6 +7,8 @@
   packages = [
     pkgs.jdk21
     pkgs.unzip
+    pkgs.git # Added for version control
+    pkgs.gh  # Added for GitHub authentication
   ];
   # Sets environment variables in the workspace
   env = {};
@@ -17,21 +19,16 @@
       "Dart-Code.dart-code"
     ];
     workspace = {
-      # Runs when a workspace is first created with this `dev.nix` file
+      # Runs when a workspace is first created with this \`dev.nix\` file
       onCreate = { };
-      # To run something each time the workspace is (re)started, use the `onStart` hook
+      # To run something each time the workspace is (re)started, use the \`onStart\` hook
     };
     # Enable previews and customize configuration
     previews = {
       enable = true;
       previews = {
         web = {
-          command = ["flutter" "run" "--machine" "-d" "web-server" "--web-hostname" "0.0.0.0" "--web-port" "$PORT"];
-          manager = "flutter";
-        };
-        android = {
-          command = ["flutter" "run" "--machine" "-d" "android" "-d" "localhost:5555"];
-          manager = "flutter";
+          # ...
         };
       };
     };
